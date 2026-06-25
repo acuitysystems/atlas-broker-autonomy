@@ -32,7 +32,7 @@ WORK_DIR="/tmp/atlas-db-refresh-$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$WORK_DIR"
 DUMP_FILE="$WORK_DIR/prod.dump"
 
-log() { echo "[$(date -u +%H:%M:%SZ)] $*"; }
+log() { echo "[$(date -u +%H:%M:%SZ)] $*" >&2; }
 fail() { log "ERROR: $*"; exit 1; }
 
 # -------- Sanity: am I in prod account? --------
