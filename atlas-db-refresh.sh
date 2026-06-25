@@ -61,15 +61,33 @@ discover_db_url() {
     --query 'taskDefinition.containerDefinitions[0].secrets[?name==`DATABASE_URL`].valueFrom' --output text)
   [[ -n "$ssm_arn" && "$ssm_arn" != "None" ]] || fail "No DATABASE_URL secret on $cluster/$service task def"
 
-  local ssm_name
-  # valueFrom can be a full ARN or a bare name
-  if [[ "$ssm_arn" == arn:* ]]; then
-    ssm_name="${ssm_arn##*:parameter}"
+  # valueFrom may be:
+  #   arn:aws:ssm:<region>:<acct>:parameter/<name>
+  #   arn:aws:secretsmanager:<region>:<acct>:secret:<name>[:json-key:version-stage:version-id]
+  #   <bare-ssm-name>
+  if [[ "$ssm_arn" == arn:aws:secretsmanager:* ]]; then
+    # Secrets Manager. ARN format: arn:aws:secretsmanager:R:A:secret:NAME-suffix[:json-key:stage:version]
+    # First 7 colon-fields = base ARN.
+    local secret_id json_key val
+    secret_id=$(echo "$ssm_arn" | awk -F: '{print $1":"$2":"$3":"$4":"$5":"$6":"$7}')
+    json_key=$(echo "$ssm_arn" | awk -F: '{print $8}')
+    val=$(${env_prefix} aws secretsmanager get-secret-value --secret-id "$secret_id" --region "$REGION" --query 'SecretString' --output text)
+    if [[ -n "$json_key" ]]; then
+      # Extract that field from JSON
+      echo "$val" | python3 -c "import sys,json; print(json.load(sys.stdin)['$json_key'])"
+    elif echo "$val" | head -c 1 | grep -q '{'; then
+      # JSON blob without a json-key in ARN — try DATABASE_URL or url keys
+      echo "$val" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('DATABASE_URL') or d.get('url') or d.get('connectionString') or list(d.values())[0])"
+    else
+      echo "$val"
+    fi
+  elif [[ "$ssm_arn" == arn:aws:ssm:* ]]; then
+    local ssm_name="${ssm_arn##*:parameter}"
+    ${env_prefix} aws ssm get-parameter --name "$ssm_name" --with-decryption --region "$REGION" --query 'Parameter.Value' --output text
   else
-    ssm_name="$ssm_arn"
+    # Bare name -> assume SSM
+    ${env_prefix} aws ssm get-parameter --name "$ssm_arn" --with-decryption --region "$REGION" --query 'Parameter.Value' --output text
   fi
-
-  ${env_prefix} aws ssm get-parameter --name "$ssm_name" --with-decryption --region "$REGION" --query 'Parameter.Value' --output text
 }
 
 # -------- Step 1: Discover & dump PROD --------
