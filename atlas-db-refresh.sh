@@ -89,6 +89,7 @@ done
 
 PGSSLMODE=require pg_dump \
   --format=custom \
+  --schema=public \
   --no-owner \
   --no-acl \
   --verbose \
