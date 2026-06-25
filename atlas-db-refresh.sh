@@ -1,334 +1,175 @@
 #!/bin/bash
-# ============================================================================
-# atlas-db-refresh.sh — synthetic-data refresh of dev + sandbox Aurora from prod
+# atlas-db-refresh.sh v2 — Full clone prod -> dev + sandbox
+# - Source: standalone RDS atlas-acuity-prod-postgres (DB: acuity)
+# - Targets: atlas-acuity-dev-aurora (008482603985), atlas-acuity-sandbox-aurora (923561819954)
+# - Secrets excluded from data dump: gmail_tokens, prs_credentials (schemas restored, no rows)
+# - Auto-discovers all DATABASE_URLs via ECS task definitions (no hardcoded SSM paths)
+# - Read-only on prod (pg_dump only). Destructive on dev/sandbox (drop schema + restore).
 #
-# RUNS IN: AWS CloudShell, account 103869374886 (Atlas mgmt/prod), us-west-2
-# RUNTIME: ~5-15 min depending on prod data size
-# IDEMPOTENT: re-runnable; each run writes to a unique S3 prefix by epoch.
-#
-# WHAT IT DOES (top to bottom, in order):
-#   1. Discover prod Aurora endpoint + credentials (from prod SSM)
-#   2. pg_dump the prod 'atlas' DB to a local temp file
-#   3. Upload the dump to a transient S3 bucket in prod (auto-cleaned at end)
-#   4. For each of [dev account 008482603985, sandbox account 923561819954]:
-#        a. AssumeRole into OrganizationAccountAccessRole
-#        b. Discover that account's Aurora endpoint + credentials (from that
-#           account's SSM)
-#        c. Download the dump (using assumed credentials -> cross-account S3 read)
-#        d. pg_restore into that account's Aurora 'acuity' DB
-#        e. Run a sanity SELECT to confirm row counts
-#   5. Delete the S3 bucket + objects (transient — never persists)
-#
-# WHAT IT DOES NOT DO:
-#   - Does NOT touch the prod 'atlas' DB (read-only pg_dump)
-#   - Does NOT change ECS, Aurora schema versions, KMS, or Terraform state
-#   - Does NOT modify SSM in prod (only reads /atlas/prod/database/url)
-#   - Does NOT scrub data (synthetic-only per David's prior decision)
-#
-# SAFETY:
-#   - Pre-flight gate: verifies you're in account 103869374886 before starting
-#   - Refuses if not us-west-2
-#   - Wraps the entire run in a temp directory under /tmp (auto-cleaned on exit)
-#   - Logs every step with timestamps
-#
-# REVERT:
-#   - Dev / sandbox: re-run prior backup snapshot restore if data looks wrong
-#     (each account's Aurora has automated backups with 7-day PITR)
-#   - Prod: untouched, no revert needed
-# ============================================================================
+# Run from CloudShell in the PROD account (103869374886) after 7pm PT.
 
 set -euo pipefail
 
-# ---------- Configuration ----------
-REGION="us-west-2"
+# -------- Settings --------
 PROD_ACCOUNT="103869374886"
 DEV_ACCOUNT="008482603985"
 SANDBOX_ACCOUNT="923561819954"
-ASSUME_ROLE_NAME="OrganizationAccountAccessRole"
+REGION="us-west-2"
 
-PROD_SSM_DB_URL="/atlas/prod/database/url"
-DEV_SSM_DB_URL="/atlas/dev/database/url"
-SANDBOX_SSM_DB_URL="/atlas/sandbox/database/url"
+PROD_CLUSTER="atlas-acuity-prod-cluster"
+PROD_SERVICE="atlas-acuity-prod-acuity-svc"
+DEV_CLUSTER="atlas-acuity-dev-cluster"
+DEV_SERVICE="atlas-acuity-dev-acuity-svc"
+SANDBOX_CLUSTER="atlas-acuity-sandbox-cluster"
+SANDBOX_SERVICE="atlas-acuity-sandbox-acuity-svc"
 
-EPOCH=$(date +%s)
-STAGING_BUCKET="atlas-db-refresh-${EPOCH}-${PROD_ACCOUNT}"
-DUMP_KEY="prod-atlas-${EPOCH}.dump"
+EXCLUDE_DATA_TABLES=(
+  "public.gmail_tokens"
+  "public.prs_credentials"
+)
 
-WORK_DIR=$(mktemp -d -t atlas-db-refresh-XXXX)
-LOG_FILE="${WORK_DIR}/run.log"
+WORK_DIR="/tmp/atlas-db-refresh-$(date +%Y%m%d-%H%M%S)"
+mkdir -p "$WORK_DIR"
+DUMP_FILE="$WORK_DIR/prod.dump"
 
-# ---------- Logging helpers ----------
-log() { echo "[$(date -u +%H:%M:%S)] $*" | tee -a "${LOG_FILE}"; }
-err() { echo "[$(date -u +%H:%M:%S)] ERROR: $*" | tee -a "${LOG_FILE}" >&2; }
+log() { echo "[$(date -u +%H:%M:%SZ)] $*"; }
+fail() { log "ERROR: $*"; exit 1; }
 
-cleanup() {
-  local rc=$?
-  log "==> Cleanup: removing local work directory"
-  if [[ -d "${WORK_DIR}" ]]; then
-    rm -rf "${WORK_DIR}"
-  fi
-  if [[ "${BUCKET_CREATED:-0}" == "1" ]]; then
-    log "==> Cleanup: emptying + deleting staging bucket s3://${STAGING_BUCKET}"
-    aws s3 rm "s3://${STAGING_BUCKET}" --recursive --region "${REGION}" >/dev/null 2>&1 || true
-    aws s3 rb "s3://${STAGING_BUCKET}" --region "${REGION}" >/dev/null 2>&1 || true
-  fi
-  if [[ ${rc} -ne 0 ]]; then
-    err "Script exited with status ${rc}. See log: ${LOG_FILE}"
-  fi
-  return ${rc}
-}
-trap cleanup EXIT
-
-# ---------- Pre-flight ----------
-log "==============================================================="
-log " Atlas DB Refresh — prod -> dev + sandbox"
-log " Epoch: ${EPOCH}"
-log " Work dir: ${WORK_DIR}"
-log "==============================================================="
-log
-log "==> Pre-flight checks"
-
+# -------- Sanity: am I in prod account? --------
 CURRENT_ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
-if [[ "${CURRENT_ACCOUNT}" != "${PROD_ACCOUNT}" ]]; then
-  err "Must run in account ${PROD_ACCOUNT}. Currently in ${CURRENT_ACCOUNT}."
-  exit 1
-fi
-log "    Account: ${CURRENT_ACCOUNT} (prod) [ok]"
+[[ "$CURRENT_ACCOUNT" == "$PROD_ACCOUNT" ]] || fail "Must run from PROD account ($PROD_ACCOUNT). Got: $CURRENT_ACCOUNT"
+log "OK: in prod account $CURRENT_ACCOUNT"
 
-if [[ "${AWS_DEFAULT_REGION:-${AWS_REGION:-}}" != "${REGION}" ]] && [[ "${AWS_REGION:-}" != "${REGION}" ]]; then
-  # CloudShell sometimes only sets AWS_REGION
-  export AWS_DEFAULT_REGION="${REGION}"
+# -------- Install postgresql-client if missing --------
+if ! command -v pg_dump >/dev/null 2>&1; then
+  log "Installing postgresql-client..."
+  sudo yum install -y postgresql15 >/dev/null 2>&1 || sudo dnf install -y postgresql15 >/dev/null 2>&1 || fail "Could not install postgresql client"
 fi
-log "    Region: ${REGION} [ok]"
+log "OK: pg_dump=$(pg_dump --version | head -1)"
 
-# Verify required tooling
-for tool in aws psql pg_dump pg_restore jq; do
-  if ! command -v "${tool}" >/dev/null 2>&1; then
-    if [[ "${tool}" == "psql" || "${tool}" == "pg_dump" || "${tool}" == "pg_restore" ]]; then
-      log "    Installing postgresql client tools (sudo dnf install -y postgresql15)"
-      sudo dnf install -y postgresql15 >/dev/null 2>&1 || sudo yum install -y postgresql15 >/dev/null 2>&1 || {
-        err "Failed to install postgresql client. Aborting."
-        exit 1
-      }
-    else
-      err "Missing required tool: ${tool}"
-      exit 1
-    fi
+# -------- Helper: discover DATABASE_URL from an ECS task def --------
+# Usage: get_database_url <cluster> <service> [aws-profile-or-env-prefix]
+discover_db_url() {
+  local cluster="$1" service="$2" env_prefix="${3:-}"
+
+  local task_def_arn
+  task_def_arn=$(${env_prefix} aws ecs describe-services --cluster "$cluster" --services "$service" --region "$REGION" --query 'services[0].taskDefinition' --output text)
+  [[ -n "$task_def_arn" && "$task_def_arn" != "None" ]] || fail "No task def for $cluster/$service"
+
+  local ssm_arn
+  ssm_arn=$(${env_prefix} aws ecs describe-task-definition --task-definition "$task_def_arn" --region "$REGION" \
+    --query 'taskDefinition.containerDefinitions[0].secrets[?name==`DATABASE_URL`].valueFrom' --output text)
+  [[ -n "$ssm_arn" && "$ssm_arn" != "None" ]] || fail "No DATABASE_URL secret on $cluster/$service task def"
+
+  local ssm_name
+  # valueFrom can be a full ARN or a bare name
+  if [[ "$ssm_arn" == arn:* ]]; then
+    ssm_name="${ssm_arn##*:parameter}"
+  else
+    ssm_name="$ssm_arn"
   fi
+
+  ${env_prefix} aws ssm get-parameter --name "$ssm_name" --with-decryption --region "$REGION" --query 'Parameter.Value' --output text
+}
+
+# -------- Step 1: Discover & dump PROD --------
+log "=== STEP 1: Discover prod DATABASE_URL ==="
+PROD_URL=$(discover_db_url "$PROD_CLUSTER" "$PROD_SERVICE")
+PROD_HOST=$(echo "$PROD_URL" | sed -E 's#.*@([^:/]+).*#\1#')
+log "OK: prod DB host = $PROD_HOST"
+
+# Strip ?sslmode= and use PGSSLMODE
+PROD_URL_CLEAN=$(echo "$PROD_URL" | sed 's/[?&]sslmode=[^&]*//')
+
+log "=== STEP 2: pg_dump from prod (read-only) ==="
+EXCLUDE_ARGS=""
+for t in "${EXCLUDE_DATA_TABLES[@]}"; do
+  EXCLUDE_ARGS="$EXCLUDE_ARGS --exclude-table-data=$t"
 done
-log "    Tools: aws, psql, pg_dump, pg_restore, jq [ok]"
 
-# Verify cross-account AssumeRole works
-for acc in "${DEV_ACCOUNT}" "${SANDBOX_ACCOUNT}"; do
-  if ! aws sts assume-role \
-        --role-arn "arn:aws:iam::${acc}:role/${ASSUME_ROLE_NAME}" \
-        --role-session-name "atlas-db-refresh-probe-${EPOCH}" \
-        --duration-seconds 900 \
-        --query 'Credentials.AccessKeyId' \
-        --output text >/dev/null 2>&1; then
-    err "Cannot AssumeRole into ${acc}. Check OrganizationAccountAccessRole trust policy."
-    exit 1
-  fi
-  log "    AssumeRole probe ${acc}: [ok]"
-done
-
-# ---------- Step 1: Read prod DB credentials ----------
-log
-log "==> Step 1/5: Read prod Aurora connection string from SSM"
-PROD_DB_URL=$(aws ssm get-parameter \
-  --name "${PROD_SSM_DB_URL}" \
-  --with-decryption \
-  --region "${REGION}" \
-  --query 'Parameter.Value' \
-  --output text)
-if [[ -z "${PROD_DB_URL}" ]]; then
-  err "Could not read ${PROD_SSM_DB_URL}"
-  exit 1
-fi
-# Extract DB name from URL for logging (URL format: postgresql://user:pass@host:5432/dbname?...)
-PROD_DB_NAME=$(echo "${PROD_DB_URL}" | sed -E 's|.*/([^?]+).*|\1|')
-PROD_DB_HOST=$(echo "${PROD_DB_URL}" | sed -E 's|.*@([^:/]+).*|\1|')
-log "    Prod host: ${PROD_DB_HOST}"
-log "    Prod database: ${PROD_DB_NAME}"
-
-# ---------- Step 2: pg_dump prod ----------
-log
-log "==> Step 2/5: pg_dump prod database (custom format, compressed)"
-DUMP_FILE="${WORK_DIR}/${DUMP_KEY}"
-PROD_DB_URL_QUOTED=$(printf %q "${PROD_DB_URL}")
-# Use custom format (-Fc) for parallel restore + selective object handling
-# --no-owner / --no-acl: roles differ across accounts; skip role grants
-# --no-tablespaces: tablespaces are env-specific
-pg_dump \
-  --dbname="${PROD_DB_URL}" \
+PGSSLMODE=require pg_dump \
   --format=custom \
-  --compress=6 \
   --no-owner \
   --no-acl \
-  --no-tablespaces \
   --verbose \
-  --file="${DUMP_FILE}" 2> "${WORK_DIR}/pg_dump.log" || {
-    err "pg_dump failed. See ${WORK_DIR}/pg_dump.log"
-    tail -30 "${WORK_DIR}/pg_dump.log" >&2
-    exit 1
-  }
-DUMP_SIZE=$(stat -c%s "${DUMP_FILE}")
-log "    Dump size: $(numfmt --to=iec --suffix=B ${DUMP_SIZE})"
+  $EXCLUDE_ARGS \
+  --file="$DUMP_FILE" \
+  "$PROD_URL_CLEAN" 2>&1 | tail -30
 
-# ---------- Step 3: Upload to transient S3 ----------
-log
-log "==> Step 3/5: Upload dump to transient S3 bucket"
-log "    Bucket: s3://${STAGING_BUCKET}"
-aws s3api create-bucket \
-  --bucket "${STAGING_BUCKET}" \
-  --region "${REGION}" \
-  --create-bucket-configuration LocationConstraint="${REGION}" >/dev/null
-BUCKET_CREATED=1
+DUMP_SIZE=$(du -h "$DUMP_FILE" | cut -f1)
+log "OK: dump complete, size=$DUMP_SIZE, path=$DUMP_FILE"
 
-# Lock down + encrypt
-aws s3api put-public-access-block --bucket "${STAGING_BUCKET}" \
-  --public-access-block-configuration BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
-aws s3api put-bucket-encryption --bucket "${STAGING_BUCKET}" \
-  --server-side-encryption-configuration '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}'
+# -------- Step 3: Verify prod still healthy (read-only operation should be safe) --------
+PROD_HEALTH=$(curl -s -o /dev/null -w '%{http_code}' https://api.acuitysystems.net/api/health)
+[[ "$PROD_HEALTH" == "200" ]] || fail "Prod health check failed AFTER dump: $PROD_HEALTH (this should never happen — pg_dump is read-only)"
+log "OK: prod /api/health = 200 (intact)"
 
-# Cross-account read policy for dev + sandbox
-cat > "${WORK_DIR}/bucket-policy.json" <<JSON
-{
-  "Version": "2012-10-17",
-  "Statement": [{
-    "Sid": "AllowDevSandboxRead",
-    "Effect": "Allow",
-    "Principal": {"AWS": [
-      "arn:aws:iam::${DEV_ACCOUNT}:root",
-      "arn:aws:iam::${SANDBOX_ACCOUNT}:root"
-    ]},
-    "Action": ["s3:GetObject", "s3:ListBucket"],
-    "Resource": [
-      "arn:aws:s3:::${STAGING_BUCKET}",
-      "arn:aws:s3:::${STAGING_BUCKET}/*"
-    ]
-  }]
-}
-JSON
-aws s3api put-bucket-policy --bucket "${STAGING_BUCKET}" --policy "file://${WORK_DIR}/bucket-policy.json"
+# -------- Step 4: Restore to DEV --------
+log "=== STEP 3: AssumeRole into DEV ($DEV_ACCOUNT) ==="
+DEV_CREDS=$(aws sts assume-role \
+  --role-arn "arn:aws:iam::${DEV_ACCOUNT}:role/OrganizationAccountAccessRole" \
+  --role-session-name atlas-db-refresh \
+  --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' \
+  --output text)
+DEV_AKID=$(echo "$DEV_CREDS" | awk '{print $1}')
+DEV_SAK=$(echo "$DEV_CREDS" | awk '{print $2}')
+DEV_TOK=$(echo "$DEV_CREDS" | awk '{print $3}')
+DEV_ENV="env AWS_ACCESS_KEY_ID=$DEV_AKID AWS_SECRET_ACCESS_KEY=$DEV_SAK AWS_SESSION_TOKEN=$DEV_TOK"
 
-# 1-day lifecycle (belt-and-suspenders; explicit cleanup happens in trap)
-aws s3api put-bucket-lifecycle-configuration --bucket "${STAGING_BUCKET}" \
-  --lifecycle-configuration '{"Rules":[{"ID":"expire-1d","Status":"Enabled","Filter":{"Prefix":""},"Expiration":{"Days":1}}]}'
+log "Discovering dev DATABASE_URL..."
+DEV_URL=$(discover_db_url "$DEV_CLUSTER" "$DEV_SERVICE" "$DEV_ENV")
+DEV_HOST=$(echo "$DEV_URL" | sed -E 's#.*@([^:/]+).*#\1#')
+log "OK: dev DB host = $DEV_HOST"
+DEV_URL_CLEAN=$(echo "$DEV_URL" | sed 's/[?&]sslmode=[^&]*//')
 
-aws s3 cp "${DUMP_FILE}" "s3://${STAGING_BUCKET}/${DUMP_KEY}" --region "${REGION}" >/dev/null
-log "    Upload complete: s3://${STAGING_BUCKET}/${DUMP_KEY}"
+log "=== STEP 4: Drop dev public schema and restore ==="
+PGSSLMODE=require psql "$DEV_URL_CLEAN" -v ON_ERROR_STOP=1 -c 'DROP SCHEMA IF EXISTS public CASCADE; CREATE SCHEMA public; GRANT ALL ON SCHEMA public TO PUBLIC;'
+PGSSLMODE=require pg_restore \
+  --no-owner --no-acl --verbose \
+  --schema=public \
+  --dbname="$DEV_URL_CLEAN" \
+  "$DUMP_FILE" 2>&1 | tail -20
 
-# ---------- Step 4: Restore into dev + sandbox ----------
-restore_into_account() {
-  local label="$1"
-  local target_account="$2"
-  local target_ssm_path="$3"
+# -------- Step 5: Restore to SANDBOX --------
+log "=== STEP 5: AssumeRole into SANDBOX ($SANDBOX_ACCOUNT) ==="
+SB_CREDS=$(aws sts assume-role \
+  --role-arn "arn:aws:iam::${SANDBOX_ACCOUNT}:role/OrganizationAccountAccessRole" \
+  --role-session-name atlas-db-refresh \
+  --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' \
+  --output text)
+SB_AKID=$(echo "$SB_CREDS" | awk '{print $1}')
+SB_SAK=$(echo "$SB_CREDS" | awk '{print $2}')
+SB_TOK=$(echo "$SB_CREDS" | awk '{print $3}')
+SB_ENV="env AWS_ACCESS_KEY_ID=$SB_AKID AWS_SECRET_ACCESS_KEY=$SB_SAK AWS_SESSION_TOKEN=$SB_TOK"
 
-  log
-  log "==> Step 4/5: Restore into ${label} (account ${target_account})"
+log "Discovering sandbox DATABASE_URL..."
+SB_URL=$(discover_db_url "$SANDBOX_CLUSTER" "$SANDBOX_SERVICE" "$SB_ENV")
+SB_HOST=$(echo "$SB_URL" | sed -E 's#.*@([^:/]+).*#\1#')
+log "OK: sandbox DB host = $SB_HOST"
+SB_URL_CLEAN=$(echo "$SB_URL" | sed 's/[?&]sslmode=[^&]*//')
 
-  # AssumeRole
-  local role_arn="arn:aws:iam::${target_account}:role/${ASSUME_ROLE_NAME}"
-  local creds_json
-  creds_json=$(aws sts assume-role \
-    --role-arn "${role_arn}" \
-    --role-session-name "atlas-db-refresh-${label}-${EPOCH}" \
-    --duration-seconds 3600 \
-    --output json)
+log "=== STEP 6: Drop sandbox public schema and restore ==="
+PGSSLMODE=require psql "$SB_URL_CLEAN" -v ON_ERROR_STOP=1 -c 'DROP SCHEMA IF EXISTS public CASCADE; CREATE SCHEMA public; GRANT ALL ON SCHEMA public TO PUBLIC;'
+PGSSLMODE=require pg_restore \
+  --no-owner --no-acl --verbose \
+  --schema=public \
+  --dbname="$SB_URL_CLEAN" \
+  "$DUMP_FILE" 2>&1 | tail -20
 
-  local AKI SAK SST
-  AKI=$(echo "${creds_json}" | jq -r .Credentials.AccessKeyId)
-  SAK=$(echo "${creds_json}" | jq -r .Credentials.SecretAccessKey)
-  SST=$(echo "${creds_json}" | jq -r .Credentials.SessionToken)
+# -------- Step 6: Final verifies --------
+log "=== STEP 7: Final health checks ==="
+PROD_HEALTH=$(curl -s -o /dev/null -w '%{http_code}' https://api.acuitysystems.net/api/health)
+DEV_HEALTH=$(curl -s -o /dev/null -w '%{http_code}' https://dev.acuitysystems.net/api/health)
+SB_HEALTH=$(curl -s -o /dev/null -w '%{http_code}' https://demo.acuitysystems.net/api/health)
+log "prod=$PROD_HEALTH dev=$DEV_HEALTH sandbox=$SB_HEALTH"
 
-  # Subshell with the assumed credentials
-  (
-    export AWS_ACCESS_KEY_ID="${AKI}"
-    export AWS_SECRET_ACCESS_KEY="${SAK}"
-    export AWS_SESSION_TOKEN="${SST}"
-    export AWS_DEFAULT_REGION="${REGION}"
+log "=== STEP 8: Verify dev/sandbox row counts ==="
+echo "--- DEV ---"
+PGSSLMODE=require psql "$DEV_URL_CLEAN" -t -c "SELECT 'agent_profiles=' || COUNT(*) FROM public.agent_profiles UNION ALL SELECT 'app_users=' || COUNT(*) FROM public.app_users UNION ALL SELECT 'system_users=' || COUNT(*) FROM public.system_users UNION ALL SELECT 'gmail_tokens=' || COUNT(*) FROM public.gmail_tokens UNION ALL SELECT 'letter_templates=' || COUNT(*) FROM public.letter_templates;" 2>&1 || true
 
-    # 4a: Get target DB URL
-    local target_url
-    target_url=$(aws ssm get-parameter \
-      --name "${target_ssm_path}" \
-      --with-decryption \
-      --region "${REGION}" \
-      --query 'Parameter.Value' \
-      --output text)
-    if [[ -z "${target_url}" ]]; then
-      err "Could not read ${target_ssm_path} in ${target_account}"
-      return 1
-    fi
-    local target_host target_db
-    target_host=$(echo "${target_url}" | sed -E 's|.*@([^:/]+).*|\1|')
-    target_db=$(echo "${target_url}" | sed -E 's|.*/([^?]+).*|\1|')
-    log "    ${label} host: ${target_host}"
-    log "    ${label} database: ${target_db}"
+echo "--- SANDBOX ---"
+PGSSLMODE=require psql "$SB_URL_CLEAN" -t -c "SELECT 'agent_profiles=' || COUNT(*) FROM public.agent_profiles UNION ALL SELECT 'app_users=' || COUNT(*) FROM public.app_users UNION ALL SELECT 'system_users=' || COUNT(*) FROM public.system_users UNION ALL SELECT 'gmail_tokens=' || COUNT(*) FROM public.gmail_tokens UNION ALL SELECT 'letter_templates=' || COUNT(*) FROM public.letter_templates;" 2>&1 || true
 
-    # 4b: Download dump (using assumed creds — cross-account read)
-    local local_dump="${WORK_DIR}/${label}.dump"
-    aws s3 cp "s3://${STAGING_BUCKET}/${DUMP_KEY}" "${local_dump}" --region "${REGION}" >/dev/null
-    log "    Downloaded dump: $(numfmt --to=iec --suffix=B $(stat -c%s ${local_dump}))"
-
-    # 4c: Drop existing data + restore
-    # CRITICAL: per David's mandate, target DBs are empty Terraform shells.
-    # We blow away the public schema cleanly and restore on top.
-    log "    Dropping + recreating 'public' schema in ${target_db}"
-    psql "${target_url}" -v ON_ERROR_STOP=1 -c "DROP SCHEMA IF EXISTS public CASCADE; CREATE SCHEMA public; GRANT ALL ON SCHEMA public TO PUBLIC;" >/dev/null
-
-    log "    pg_restore -> ${label} (this may take a few min)..."
-    pg_restore \
-      --dbname="${target_url}" \
-      --no-owner \
-      --no-acl \
-      --no-tablespaces \
-      --jobs=4 \
-      --verbose \
-      "${local_dump}" 2> "${WORK_DIR}/pg_restore-${label}.log" || {
-        # pg_restore returns nonzero on warnings (e.g., extension owner mismatch).
-        # Check if any FATAL errors are present.
-        if grep -q "ERROR:" "${WORK_DIR}/pg_restore-${label}.log"; then
-          err "pg_restore had errors. See ${WORK_DIR}/pg_restore-${label}.log"
-          grep "ERROR:" "${WORK_DIR}/pg_restore-${label}.log" | head -20 >&2
-          return 1
-        fi
-      }
-
-    # 4d: Sanity check — row counts
-    log "    Sanity check: counting rows in key tables"
-    psql "${target_url}" -v ON_ERROR_STOP=1 -t -c "
-      SELECT 'tables: ' || count(*)::text FROM information_schema.tables WHERE table_schema='public';
-      SELECT 'users: ' || count(*)::text FROM users;
-    " 2>/dev/null | sed 's/^/      /' | tee -a "${LOG_FILE}" || {
-      log "      (table count probe failed — tables may have different names; that's ok)"
-    }
-
-    log "    ${label} restore complete"
-    rm -f "${local_dump}"
-  )
-  local rc=$?
-  if [[ ${rc} -ne 0 ]]; then
-    err "Restore into ${label} failed (rc=${rc})"
-    return 1
-  fi
-  return 0
-}
-
-restore_into_account "dev" "${DEV_ACCOUNT}" "${DEV_SSM_DB_URL}"
-restore_into_account "sandbox" "${SANDBOX_ACCOUNT}" "${SANDBOX_SSM_DB_URL}"
-
-# ---------- Step 5: Done ----------
-log
-log "==============================================================="
-log " SUCCESS"
-log "==============================================================="
-log " Prod DB dumped from: ${PROD_DB_HOST}"
-log " Dev refreshed:       account ${DEV_ACCOUNT}"
-log " Sandbox refreshed:   account ${SANDBOX_ACCOUNT}"
-log " Transient S3 bucket: will be deleted on exit"
-log " Local work dir:      will be deleted on exit"
-log "==============================================================="
-
-exit 0
+log "=== DONE ==="
+log "Expected: agent_profiles=10, app_users=7, system_users=15, gmail_tokens=0 (excluded), letter_templates=27"
+log "Dump preserved at: $DUMP_FILE"
