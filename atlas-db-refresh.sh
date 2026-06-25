@@ -60,11 +60,15 @@ discover_db_url() {
   ssm_arn=$(${env_prefix} aws ecs describe-task-definition --task-definition "$task_def_arn" --region "$REGION" \
     --query 'taskDefinition.containerDefinitions[0].secrets[?name==`DATABASE_URL`].valueFrom' --output text)
   [[ -n "$ssm_arn" && "$ssm_arn" != "None" ]] || fail "No DATABASE_URL secret on $cluster/$service task def"
+  log "DEBUG: valueFrom = $ssm_arn"
 
   # valueFrom may be:
   #   arn:aws:ssm:<region>:<acct>:parameter/<name>
   #   arn:aws:secretsmanager:<region>:<acct>:secret:<name>[:json-key:version-stage:version-id]
   #   <bare-ssm-name>
+  # Trim whitespace/newlines that 'aws ... --output text' can leave in arrays
+  ssm_arn=$(echo "$ssm_arn" | tr -d '[:space:]')
+
   if [[ "$ssm_arn" == arn:aws:secretsmanager:* ]]; then
     # Secrets Manager. ARN format: arn:aws:secretsmanager:R:A:secret:NAME-suffix[:json-key:stage:version]
     # First 7 colon-fields = base ARN.
