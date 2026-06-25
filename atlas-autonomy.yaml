@@ -1,0 +1,574 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Atlas Broker Autonomy Kit. Expands existing atlas-ops-broker with self-update,
+  SSM read, RDS snapshot/restore, ECS task-def updates. Creates a second nonprod
+  broker bounded to Environment=dev|demo. Adds kill switch, daily-rotating
+  destructive token, and audit cron.
+
+Parameters:
+  ProdBrokerRoleName:
+    Type: String
+    Default: atlas-ops-broker-role
+    Description: Name of the EXISTING IAM role used by atlas-ops-broker.
+
+  ProdBrokerFunctionName:
+    Type: String
+    Default: atlas-ops-broker
+    Description: Name of the existing prod broker Lambda.
+
+  NonProdBrokerFunctionName:
+    Type: String
+    Default: atlas-ops-broker-nonprod
+    Description: Name of the new nonprod broker Lambda to create.
+
+  AtlasProdTaskRoleArn:
+    Type: String
+    Default: arn:aws:iam::103869374886:role/atlas-acuity-prod-task-role
+    Description: ARN of the prod ECS task role (for PassRole in task-def registration).
+
+  AtlasProdExecutionRoleArn:
+    Type: String
+    Default: arn:aws:iam::103869374886:role/atlas-acuity-prod-execution-role
+    Description: ARN of the prod ECS execution role.
+
+  BrokerCodeBaseUrl:
+    Type: String
+    Default: https://raw.githubusercontent.com/acuitysystems/atlas-broker-autonomy/main
+    Description: Base URL for downloading broker code zips.
+
+Resources:
+
+  # ---------------------------------------------------------------------------
+  # S3 deploy bucket for broker code zips
+  # ---------------------------------------------------------------------------
+  DeployBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub atlas-ops-broker-deploys-${AWS::AccountId}
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: retain-90-days-noncurrent
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: 90
+
+  # ---------------------------------------------------------------------------
+  # SSM control plane
+  # ---------------------------------------------------------------------------
+  BrokerEnabledParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /atlas/broker/enabled
+      Description: Master kill switch for atlas-ops-broker writes. Set to false to halt.
+      Type: String
+      Value: "true"
+
+  DestructiveTokenParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /atlas/broker/destructive-token
+      Description: Daily-rotating token required for destructive broker commands.
+      Type: String
+      Value: PENDING_FIRST_ROTATION
+
+  AuditBaselineParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /atlas/broker/last-audit-baseline
+      Description: JSON baseline for audit-cron delta detection.
+      Type: String
+      Value: "{}"
+      Tier: Advanced
+
+  # ---------------------------------------------------------------------------
+  # CodeFetcher: custom-resource Lambda that downloads broker zips from
+  # GitHub and writes them to DeployBucket. Runs once on stack create/update.
+  # ---------------------------------------------------------------------------
+  CodeFetcherRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: WriteDeployBucket
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt DeployBucket.Arn
+                  - !Sub "${DeployBucket.Arn}/*"
+
+  CodeFetcherFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: atlas-broker-code-fetcher
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 300
+      MemorySize: 512
+      Role: !GetAtt CodeFetcherRole.Arn
+      Code:
+        ZipFile: |
+          import json, urllib.request, zipfile, io, boto3, hashlib
+
+          # Minimal cfnresponse implementation (the AWS-bundled module is only
+          # auto-available for Python 3.7-3.9 runtimes, NOT for 3.12).
+          def send(event, context, status, data=None, physical_id=None, reason=None):
+              body = {
+                  "Status": status,
+                  "Reason": reason or f"See CloudWatch: {context.log_stream_name}",
+                  "PhysicalResourceId": physical_id or context.log_stream_name,
+                  "StackId": event["StackId"],
+                  "RequestId": event["RequestId"],
+                  "LogicalResourceId": event["LogicalResourceId"],
+                  "NoEcho": False,
+                  "Data": data or {},
+              }
+              data_bytes = json.dumps(body).encode("utf-8")
+              req = urllib.request.Request(
+                  event["ResponseURL"], data=data_bytes, method="PUT",
+                  headers={"content-type": "", "content-length": str(len(data_bytes))},
+              )
+              urllib.request.urlopen(req, timeout=30).read()
+
+          s3 = boto3.client("s3")
+
+          def fetch_and_zip(url, dest_bucket, dest_key):
+              with urllib.request.urlopen(url, timeout=60) as r:
+                  body = r.read()
+              if len(body) < 1000:
+                  raise RuntimeError(f"Source too small ({len(body)}) for {url} — wrong URL?")
+              buf = io.BytesIO()
+              with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                  zf.writestr("lambda_function.py", body)
+              buf.seek(0)
+              s3.put_object(Bucket=dest_bucket, Key=dest_key, Body=buf.getvalue())
+              return hashlib.sha256(body).hexdigest()[:16]
+
+          def handler(event, context):
+              print("event:", json.dumps(event))
+              try:
+                  if event["RequestType"] == "Delete":
+                      send(event, context, "SUCCESS")
+                      return
+                  base = event["ResourceProperties"]["BaseUrl"]
+                  bucket = event["ResourceProperties"]["Bucket"]
+                  prod_sha = fetch_and_zip(f"{base}/prod-broker.py", bucket, "atlas-ops-broker/lambda_function.zip")
+                  nonprod_sha = fetch_and_zip(f"{base}/nonprod-broker.py", bucket, "atlas-ops-broker-nonprod/lambda_function.zip")
+                  send(event, context, "SUCCESS", {"ProdSha": prod_sha, "NonProdSha": nonprod_sha})
+              except Exception as e:
+                  print("ERR:", repr(e))
+                  send(event, context, "FAILED", {"Error": str(e)})
+
+  FetchCodeNow:
+    Type: Custom::FetchCode
+    DependsOn:
+      - DeployBucket
+      - CodeFetcherFunction
+    Properties:
+      ServiceToken: !GetAtt CodeFetcherFunction.Arn
+      BaseUrl: !Ref BrokerCodeBaseUrl
+      Bucket: !Ref DeployBucket
+      Version: "1"
+
+  # ---------------------------------------------------------------------------
+  # Prod broker IAM expansion (allow) + hard deny
+  # ---------------------------------------------------------------------------
+  ProdBrokerExpansionPolicy:
+    Type: AWS::IAM::Policy
+    DependsOn: DeployBucket
+    Properties:
+      PolicyName: atlas-ops-broker-expansion
+      Roles: [ !Ref ProdBrokerRoleName ]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: BrokerSelfUpdate
+            Effect: Allow
+            Action:
+              - lambda:UpdateFunctionCode
+              - lambda:GetFunction
+              - lambda:GetFunctionConfiguration
+            Resource:
+              - !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${ProdBrokerFunctionName}
+          - Sid: ReadDeployBucket
+            Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:GetObjectVersion
+              - s3:ListBucket
+            Resource:
+              - !GetAtt DeployBucket.Arn
+              - !Sub "${DeployBucket.Arn}/*"
+          - Sid: ReadAtlasSSM
+            Effect: Allow
+            Action:
+              - ssm:GetParameter
+              - ssm:GetParameters
+              - ssm:GetParametersByPath
+              - ssm:DescribeParameters
+            Resource: !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/atlas/*
+          - Sid: WriteBrokerControlPlane
+            Effect: Allow
+            Action: ssm:PutParameter
+            Resource:
+              - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/atlas/broker/destructive-token
+              - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/atlas/broker/last-audit-baseline
+          - Sid: RdsSnapshotRestore
+            Effect: Allow
+            Action:
+              - rds:CreateDBClusterSnapshot
+              - rds:CreateDBSnapshot
+              - rds:CopyDBClusterSnapshot
+              - rds:CopyDBSnapshot
+              - rds:RestoreDBClusterFromSnapshot
+              - rds:RestoreDBInstanceFromDBSnapshot
+              - rds:DescribeDBClusters
+              - rds:DescribeDBInstances
+              - rds:DescribeDBClusterSnapshots
+              - rds:DescribeDBSnapshots
+              - rds:ListTagsForResource
+              - rds:AddTagsToResource
+            Resource: "*"
+          - Sid: EcsTaskDefAndServiceUpdate
+            Effect: Allow
+            Action:
+              - ecs:RegisterTaskDefinition
+              - ecs:DescribeTaskDefinition
+              - ecs:ListTaskDefinitions
+              - ecs:DeregisterTaskDefinition
+              - ecs:UpdateService
+              - ecs:DescribeServices
+              - ecs:DescribeClusters
+              - ecs:DescribeTasks
+              - ecs:ListTasks
+              - ecs:ListServices
+              - ecs:ListClusters
+              - ecs:TagResource
+            Resource: "*"
+          - Sid: PassRoleForTaskDefRegistration
+            Effect: Allow
+            Action: iam:PassRole
+            Resource:
+              - !Ref AtlasProdTaskRoleArn
+              - !Ref AtlasProdExecutionRoleArn
+            Condition:
+              StringEquals:
+                iam:PassedToService: ecs-tasks.amazonaws.com
+          - Sid: ReadCloudWatchLogs
+            Effect: Allow
+            Action:
+              - logs:DescribeLogGroups
+              - logs:DescribeLogStreams
+              - logs:FilterLogEvents
+              - logs:GetLogEvents
+            Resource: "*"
+
+  ProdBrokerHardDenyPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: atlas-ops-broker-hard-deny
+      Roles: [ !Ref ProdBrokerRoleName ]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: HardDenyDestructive
+            Effect: Deny
+            Action:
+              - iam:CreateUser
+              - iam:DeleteUser
+              - iam:CreateAccessKey
+              - iam:DeleteAccessKey
+              - iam:AttachUserPolicy
+              - iam:PutUserPolicy
+              - kms:*
+              - secretsmanager:GetSecretValue
+              - secretsmanager:PutSecretValue
+              - rds:DeleteDBCluster
+              - rds:DeleteDBInstance
+              - rds:DeleteDBClusterSnapshot
+              - ecs:DeleteCluster
+              - ecs:DeleteService
+              - lambda:DeleteFunction
+              - s3:DeleteBucket
+              - s3:PutBucketPolicy
+            Resource: "*"
+
+  # ---------------------------------------------------------------------------
+  # Nonprod broker role + policies + Lambda
+  # ---------------------------------------------------------------------------
+  NonProdBrokerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: atlas-ops-broker-nonprod-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  NonProdBrokerPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: atlas-ops-broker-nonprod-policy
+      Roles: [ !Ref NonProdBrokerRole ]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: EcsNonProdTagged
+            Effect: Allow
+            Action: "ecs:*"
+            Resource: "*"
+            Condition:
+              StringEqualsIfExists:
+                aws:ResourceTag/Environment: ["dev", "demo"]
+          - Sid: EcsReadOnly
+            Effect: Allow
+            Action:
+              - ecs:Describe*
+              - ecs:List*
+              - ecs:RegisterTaskDefinition
+              - ecs:DeregisterTaskDefinition
+            Resource: "*"
+          - Sid: RdsNonProdTagged
+            Effect: Allow
+            Action:
+              - rds:CreateDBCluster
+              - rds:CreateDBInstance
+              - rds:CreateDBClusterSnapshot
+              - rds:CreateDBSnapshot
+              - rds:CopyDBClusterSnapshot
+              - rds:RestoreDBClusterFromSnapshot
+              - rds:RestoreDBInstanceFromDBSnapshot
+              - rds:ModifyDBCluster
+              - rds:ModifyDBInstance
+              - rds:RebootDBInstance
+              - rds:AddTagsToResource
+              - rds:RemoveTagsFromResource
+            Resource: "*"
+            Condition:
+              StringEqualsIfExists:
+                aws:ResourceTag/Environment: ["dev", "demo"]
+          - Sid: RdsNonProdDelete
+            Effect: Allow
+            Action:
+              - rds:DeleteDBCluster
+              - rds:DeleteDBInstance
+              - rds:DeleteDBClusterSnapshot
+              - rds:DeleteDBSnapshot
+            Resource: "*"
+            Condition:
+              StringEquals:
+                aws:ResourceTag/Environment: ["dev", "demo"]
+          - Sid: RdsReadOnly
+            Effect: Allow
+            Action:
+              - rds:Describe*
+              - rds:ListTagsForResource
+            Resource: "*"
+          - Sid: ReadNonProdSSM
+            Effect: Allow
+            Action:
+              - ssm:GetParameter
+              - ssm:GetParameters
+              - ssm:GetParametersByPath
+            Resource:
+              - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/atlas/dev/*
+              - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/atlas/demo/*
+              - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/atlas/broker/*
+          - Sid: ReadNonProdSecrets
+            Effect: Allow
+            Action:
+              - secretsmanager:GetSecretValue
+              - secretsmanager:DescribeSecret
+            Resource:
+              - !Sub arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:atlas/dev/*
+              - !Sub arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:atlas/demo/*
+          - Sid: S3DeployRead
+            Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:GetObjectVersion
+              - s3:ListBucket
+            Resource:
+              - !GetAtt DeployBucket.Arn
+              - !Sub "${DeployBucket.Arn}/*"
+          - Sid: S3NonProdData
+            Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:PutObject
+              - s3:DeleteObject
+              - s3:ListBucket
+            Resource:
+              - arn:aws:s3:::atlas-acuity-dev-*
+              - arn:aws:s3:::atlas-acuity-dev-*/*
+              - arn:aws:s3:::atlas-acuity-demo-*
+              - arn:aws:s3:::atlas-acuity-demo-*/*
+          - Sid: LambdaSelfUpdate
+            Effect: Allow
+            Action:
+              - lambda:UpdateFunctionCode
+              - lambda:GetFunction
+              - lambda:GetFunctionConfiguration
+            Resource:
+              - !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${NonProdBrokerFunctionName}
+          - Sid: PassRoleNonProdEcs
+            Effect: Allow
+            Action: iam:PassRole
+            Resource:
+              - !Sub arn:aws:iam::${AWS::AccountId}:role/atlas-acuity-dev-*
+              - !Sub arn:aws:iam::${AWS::AccountId}:role/atlas-acuity-demo-*
+            Condition:
+              StringEquals:
+                iam:PassedToService: ecs-tasks.amazonaws.com
+          - Sid: Logs
+            Effect: Allow
+            Action:
+              - logs:DescribeLogGroups
+              - logs:DescribeLogStreams
+              - logs:FilterLogEvents
+              - logs:GetLogEvents
+            Resource: "*"
+
+  NonProdBrokerHardDeny:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: atlas-ops-broker-nonprod-hard-deny
+      Roles: [ !Ref NonProdBrokerRole ]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyAnyProdTagged
+            Effect: Deny
+            NotAction:
+              - ecs:Describe*
+              - ecs:List*
+              - rds:Describe*
+              - rds:List*
+              - lambda:GetFunction*
+              - lambda:List*
+              - logs:*
+              - ssm:Describe*
+              - ssm:List*
+            Resource: "*"
+            Condition:
+              StringEquals:
+                aws:ResourceTag/Environment: prod
+          - Sid: DenyProdNameMatch
+            Effect: Deny
+            Action:
+              - ecs:UpdateService
+              - ecs:DeleteService
+              - ecs:RunTask
+              - ecs:StopTask
+              - rds:DeleteDBCluster
+              - rds:DeleteDBInstance
+              - rds:ModifyDBCluster
+              - rds:ModifyDBInstance
+            Resource:
+              - !Sub arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:cluster/atlas-acuity-prod-*
+              - !Sub arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:service/atlas-acuity-prod-*/*
+              - !Sub arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:task-definition/atlas-acuity-prod-*
+              - !Sub arn:aws:rds:${AWS::Region}:${AWS::AccountId}:cluster:atlas-acuity-prod-*
+              - !Sub arn:aws:rds:${AWS::Region}:${AWS::AccountId}:db:atlas-acuity-prod-*
+
+  NonProdBrokerFunction:
+    Type: AWS::Lambda::Function
+    DependsOn:
+      - FetchCodeNow
+      - NonProdBrokerPolicy
+      - NonProdBrokerHardDeny
+    Properties:
+      FunctionName: !Ref NonProdBrokerFunctionName
+      Role: !GetAtt NonProdBrokerRole.Arn
+      Handler: lambda_function.lambda_handler
+      Runtime: python3.12
+      Timeout: 300
+      MemorySize: 512
+      Code:
+        S3Bucket: !Ref DeployBucket
+        S3Key: atlas-ops-broker-nonprod/lambda_function.zip
+      Environment:
+        Variables:
+          ENVIRONMENT_BOUNDARY: "dev,demo"
+          DEPLOY_BUCKET: !Ref DeployBucket
+          DEPLOY_KEY_PREFIX: "atlas-ops-broker-nonprod/"
+
+  # ---------------------------------------------------------------------------
+  # Audit cron — daily at 13:05 UTC, invokes prod broker run_audit_and_rotate_token
+  # ---------------------------------------------------------------------------
+  AuditCronRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: atlas-broker-daily-audit
+      Description: Daily audit + token rotation for atlas-ops-broker
+      ScheduleExpression: "cron(5 13 * * ? *)"
+      State: ENABLED
+      Targets:
+        - Id: prod-broker
+          Arn: !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${ProdBrokerFunctionName}
+          Input: '{"command":"run_audit_and_rotate_token","args":{}}'
+
+  AuditCronPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ProdBrokerFunctionName
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt AuditCronRule.Arn
+
+Outputs:
+  DeployBucketName:
+    Value: !Ref DeployBucket
+    Description: S3 bucket where broker code zips live.
+
+  NonProdBrokerArn:
+    Value: !GetAtt NonProdBrokerFunction.Arn
+    Description: ARN of the new nonprod broker.
+
+  PanicButtonParam:
+    Value: !Ref BrokerEnabledParam
+    Description: Flip to "false" to halt all broker writes immediately.
+
+  DestructiveTokenParam:
+    Value: !Ref DestructiveTokenParam
+    Description: SSM path for daily-rotating destructive-ops token.
+
+  AuditCronRuleName:
+    Value: !Ref AuditCronRule
+    Description: EventBridge rule for the daily audit.
+
+  NextStep:
+    Value: !Sub |
+      Stack complete. To activate the new prod broker code, invoke update_self
+      with the destructive token from /atlas/broker/destructive-token.
+      The nonprod broker is already running the new code.
+    Description: What to do next.
